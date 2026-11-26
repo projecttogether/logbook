@@ -1,0 +1,236 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "26.13.0"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  secrets:
+    name: Secrets in the history
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The CLI needs no license key or provider credentials.
+      - name: Install the pinned Gitleaks CLI
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output gitleaks.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' | sha256sum --check
+          tar -xzf gitleaks.tar.gz gitleaks
+      # Every commit of the history, merge commits too, without showing what matched
+      # (.gitleaks.toml lists the repository's invented values).
+      - name: Scan the history
+        run: '"${{ runner.temp }}/gitleaks" git . --log-opts="--diff-merges=first-parent HEAD" --redact=100 --no-banner'
+
+  checks:
+    name: Lint, types, unit tests, build, audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Check public repository contents
+        run: node scripts/check-public-repository.mjs
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+      - name: Migrations match the schema
+        run: |
+          npx drizzle-kit generate --name ci-check
+          if [ -n "$(git status --porcelain drizzle)" ]; then
+            git status --porcelain drizzle
+            echo "src/lib/db/schema.ts has changes without a migration. Run: npm run db:generate"
+            exit 1
+          fi
+      - run: npm run build
+      # Moderate findings are excluded: the only ones today come from
+      # drizzle-kit (a Better Auth peer dependency) and affect esbuild's dev
+      # server, which never runs in production.
+      - run: npm audit --omit=dev --audit-level=high
+
+  integration:
+    name: Integration tests (PostgreSQL 18)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: logbook
+          POSTGRES_PASSWORD: logbook
+          POSTGRES_DB: logbook
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U logbook -d logbook"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://logbook:logbook@localhost:5432/logbook_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run test:integration
+
+  e2e:
+    name: End-to-end tests (Keycloak, PostgreSQL 18)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: logbook
+          POSTGRES_PASSWORD: logbook
+          POSTGRES_DB: logbook
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U logbook -d logbook"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Start Keycloak with the development realm
+        run: |
+          docker run -d --name keycloak -p 8090:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -v "$PWD/dev/keycloak:/opt/keycloak/data/import:ro" \
+            quay.io/keycloak/keycloak:26.8.2-3 start-dev --import-realm --http-port=8080
+      - run: npm ci --no-audit --no-fund
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - name: Wait for Keycloak
+        run: |
+          for i in $(seq 1 90); do
+            curl -fsS http://localhost:8090/realms/logbook/.well-known/openid-configuration > /dev/null && exit 0
+            sleep 2
+          done
+          docker logs keycloak | tail -50
+          exit 1
+      - name: Start Logbook (web and worker)
+        run: |
+          set -a; source .env.example; set +a
+          # Production refuses the example secret.
+          export BETTER_AUTH_SECRET="$(openssl rand -base64 32)"
+          export NODE_ENV=production TZ=Europe/Amsterdam PORT=3000 HOSTNAME=127.0.0.1 WORKER_HEARTBEAT_FILE="$RUNNER_TEMP/heartbeat"
+          cp -r .next/static .next/standalone/.next/static
+          cp -r public .next/standalone/public
+          LOGBOOK_PROCESS=migrate node dist/migrate.mjs
+          LOGBOOK_PROCESS=web nohup node .next/standalone/server.js > "$RUNNER_TEMP/web.log" 2>&1 &
+          LOGBOOK_PROCESS=worker nohup node dist/worker.mjs > "$RUNNER_TEMP/worker.log" 2>&1 &
+          # A second instance with the manual directory and its own database.
+          PGPASSWORD=logbook psql -h localhost -p 55432 -U logbook -d logbook -c "create database logbook_manual"
+          export DATABASE_URL=postgres://logbook:logbook@localhost:55432/logbook_manual
+          export DIRECTORY=manual INITIAL_ADMIN_EMAILS=adam@example.test LOGBOOK_BASE_URL=http://localhost:3001 PORT=3001
+          LOGBOOK_PROCESS=migrate node dist/migrate.mjs
+          LOGBOOK_PROCESS=web nohup node .next/standalone/server.js > "$RUNNER_TEMP/web-manual.log" 2>&1 &
+      - name: Wait for Logbook
+        run: |
+          for i in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:3000/-/readyz > /dev/null && curl -fsS http://127.0.0.1:3001/-/readyz > /dev/null && exit 0
+            sleep 2
+          done
+          echo "Logbook did not become ready"
+          cat "$RUNNER_TEMP/web.log" "$RUNNER_TEMP/worker.log" "$RUNNER_TEMP/web-manual.log"
+          exit 1
+      - run: npm run test:e2e
+        env:
+          CI: "true"
+          # The proposal tests move deadlines into the past in the app's database.
+          DATABASE_URL: postgres://logbook:logbook@localhost:55432/logbook
+      - name: Logs
+        if: failure()
+        run: cat "$RUNNER_TEMP/web.log" "$RUNNER_TEMP/worker.log" "$RUNNER_TEMP/web-manual.log"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPOSE_FILE: compose.yaml:compose.postgres.yaml
+      COMPOSE_PROJECT_NAME: logbook-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      # The image built here, under the name compose.yaml runs, and fake settings.
+      LOGBOOK_IMAGE_TAG: ci
+      POSTGRES_PASSWORD: ci-only-password
+      DATABASE_URL: postgres://logbook:ci-only-password@postgres:5432/logbook
+      LOGBOOK_BASE_URL: https://logbook.example.invalid
+      BETTER_AUTH_SECRET: ci-only-not-a-secret-ci-only-not-a-secret
+      OIDC_ISSUER: https://sso.example.invalid/realms/logbook
+      OIDC_CLIENT_ID: logbook
+      OIDC_CLIENT_SECRET: ci-only
+      INITIAL_ADMIN_EMAILS: admin@example.invalid
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t ghcr.io/projecttogether/logbook:ci --build-arg APP_VERSION=ci .
+      - name: The image runs as a non-root user
+        run: test "$(docker run --rm --entrypoint id ghcr.io/projecttogether/logbook:ci -u)" = "1000"
+      - name: compose.yaml starts the migration, web and worker
+        run: |
+          docker compose up -d --wait --wait-timeout 180 web worker
+          docker compose exec -T web node -e "fetch('http://127.0.0.1:3000/-/healthz').then((r) => r.json()).then((b) => process.exit(b.version === 'ci' ? 0 : 1))"
+      - name: The operator command is on the PATH and reads the settings
+        run: |
+          docker compose exec -T web cli help | grep -q "cli settings list"
+          docker compose exec -T web cli settings list | tee list.txt
+          grep -Eq "^slack +not set" list.txt
+          echo '{"url":"https://hooks.example.org/logbook","secret":"ci-only-signing-secret-0123"}' | docker compose run --rm -T migrate cli settings apply webhook | grep -q '"state": "set"'
+      - name: A stop lets the worker end cleanly
+        run: |
+          docker compose stop worker
+          docker compose logs worker | grep -q '"msg":"worker stopped"'
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Remove CI containers and volumes
+        if: always()
+        run: docker compose down --volumes --remove-orphans
