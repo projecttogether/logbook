@@ -1,0 +1,15 @@
+# Gitleaks (the CI job "Secrets in the history"): its default rules, without
+# the invented values of this repository. Each is an example or test value,
+# never valid where the app is in use (config.ts refuses the example secret).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Example and test values"
+regexes = [
+  # A Slack bot token of the tests (src/lib/integrations/integrations.int.test.ts),
+  # also listed in scripts/check-public-repository.mjs.
+  '''^xoxb-integration-secret-7f3a$''',
+  # A token the log must hold back (src/lib/logger.test.ts).
+  '''^xoxb-private-1$''',
+]

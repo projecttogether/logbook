@@ -1,0 +1,104 @@
+# Logbook in production on a Linux server (Debian, Ubuntu) with Docker
+# Compose: one image, three services, and the PostgreSQL 18 in DATABASE_URL.
+# Settings live in .env next to this file:
+#
+#   cp .env.example .env    # then set the production values, see docs/configuration.md
+#   docker compose up -d --pull always
+#
+# LOGBOOK_IMAGE_TAG in .env selects the image of ghcr.io/projecttogether/logbook:
+# latest (the newest commit on main, the default) or sha-<commit> for one
+# build. To upgrade, run the same command again: it pulls the newer image.
+#
+# Without a PostgreSQL of your own, add compose.postgres.yaml: it runs one
+# next to Logbook (docs/deployment.md).
+#
+# `web` listens on 127.0.0.1:3000 (LOGBOOK_PORT changes the host port), for a
+# reverse proxy on the same server, such as Caddy, that terminates HTTPS; set
+# LOGBOOK_BASE_URL to its public URL. `migrate` runs once before `web` and
+# `worker` start. Back up the database. Local development uses
+# compose.dev.yaml.
+
+x-image: &image ghcr.io/projecttogether/logbook:${LOGBOOK_IMAGE_TAG:-latest}
+
+x-app-environment: &app-environment
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+  # Signs sessions (web) and seals the secrets of Admin › Integrations (every
+  # process, also `cli` in `migrate`).
+  BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET}
+  TZ: ${TZ:-UTC}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+x-directory-environment: &directory-environment
+  LOGBOOK_BASE_URL: ${LOGBOOK_BASE_URL:?Set LOGBOOK_BASE_URL}
+  OIDC_ISSUER: ${OIDC_ISSUER:?Set OIDC_ISSUER}
+  OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?Set OIDC_CLIENT_ID}
+  OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?Set OIDC_CLIENT_SECRET}
+  DIRECTORY: ${DIRECTORY:-manual}
+  INITIAL_ADMIN_EMAILS: ${INITIAL_ADMIN_EMAILS:-}
+  KEYCLOAK_ACCESS_GROUP: ${KEYCLOAK_ACCESS_GROUP:-}
+  KEYCLOAK_ADMIN_GROUP: ${KEYCLOAK_ADMIN_GROUP:-}
+  KEYCLOAK_TEAMS_GROUP: ${KEYCLOAK_TEAMS_GROUP:-}
+  KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-}
+  KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
+
+# Error reporting to Sentry; off without SENTRY_DSN.
+x-error-reporting-environment: &error-reporting-environment
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-}
+  SENTRY_RELEASE: ${SENTRY_RELEASE:-}
+
+services:
+  migrate:
+    image: *image
+    command: ["migrate"]
+    restart: "no"
+    environment:
+      <<: *app-environment
+
+  web:
+    image: *image
+    command: ["web"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      # Only on the server itself, for the reverse proxy. LOGBOOK_PORT picks
+      # another host port when 3000 is taken, e.g. by another app.
+      - "127.0.0.1:${LOGBOOK_PORT:-3000}:3000"
+    environment:
+      <<: [*app-environment, *directory-environment, *error-reporting-environment]
+      OIDC_SCOPES: ${OIDC_SCOPES:-}
+      OIDC_TRUST_EMAIL: ${OIDC_TRUST_EMAIL:-}
+    healthcheck:
+      # Readiness: database reachable and migrations applied.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/-/readyz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    image: *image
+    command: ["worker"]
+    restart: unless-stopped
+    # A stop (a deploy) lets the worker finish what it is doing: the message or
+    # webhook delivery it is sending (30 seconds at most). It takes nothing new
+    # meanwhile (docs/deployment.md, Restarts and deploys).
+    stop_grace_period: 1m
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: [*app-environment, *directory-environment, *error-reporting-environment]
+    healthcheck:
+      # The worker refreshes its heartbeat file every 30 seconds.
+      test: ["CMD", "node", "dist/worker-healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

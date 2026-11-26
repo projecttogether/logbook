@@ -1,0 +1,39 @@
+# Local development: PostgreSQL 18 and a Keycloak with a development realm.
+#   docker compose -f compose.dev.yaml up -d
+# Keycloak: http://localhost:8090 (admin / admin), realm "logbook".
+# The production setup is compose.yaml.
+name: logbook-dev
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: logbook
+      POSTGRES_PASSWORD: logbook
+      POSTGRES_DB: logbook
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logbook -d logbook"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2-3
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # The image sizes the heap from host RAM (up to 70 %); cap it for local use.
+      JAVA_OPTS_KC_HEAP: "-Xms64m -Xmx512m"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8090:8080"
+    volumes:
+      - ./dev/keycloak:/opt/keycloak/data/import:ro
+
+volumes:
+  postgres-data:
